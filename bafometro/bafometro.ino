@@ -2,144 +2,191 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+// ===================== PINAGEM (seguindo a imagem) =====================
+// OLED I2C
+static const int I2C_SDA = 8;   // PIN 8 (assumindo GPIO8)
+static const int I2C_SCL = 9;   // PIN 9 (assumindo GPIO9)
+
+// MQ-3 analógico
+static const int MQ3_PIN = 1;   // PIN 1 (assumindo GPIO1 / ADC)
+
+// ===================== DISPLAY =====================
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-#define OLED_ADDR 0x3C
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+// ===================== CONFIG =====================
+static const uint32_t WARMUP_SEC = 10;     // 3 minutos
+static const uint16_t SAMPLE_MS  = 50;      // taxa de amostragem do ADC
+static const uint16_t BASELINE_SAMPLES = 600; // ~30s se SAMPLE_MS=50
 
-const int MQ3_PIN = A1;
-const int SAMPLES = 30;
+// Conversão "estimada" (ajuste no seu teste real)
+// mg/L = (adc_filtrado - baseline_adc) * MG_PER_L_PER_ADC
+static const float MG_PER_L_PER_ADC = 0.0025f;  // ajuste fino aqui
+static const float MG_L_MAX = 2.50f;            // limite pra barra/escala
 
-// ====== AJUSTES IMPORTANTES ======
-// Tempo mínimo de aquecimento antes de calibrar (recomendado: >= 5 min; ideal: bem mais)
-const unsigned long WARMUP_MS = 1UL * 10UL * 1000UL;
+// Suavização
+static const float EMA_ALPHA = 0.08f; // 0.05~0.15 (menor = mais suave)
 
-// Valor “zero” (baseline) medido no ar limpo (vai ser calculado automaticamente)
-int baselineRaw = 0;
+// ===================== ESTADO =====================
+enum State { ST_WARMUP, ST_RUNNING };
+State st = ST_WARMUP;
 
-// Fator de conversão para mg/L (VOCÊ AJUSTA)
-// Ex.: se você soprar e um bafômetro de referência mostrar 0.25 mg/L e seu deltaRaw for 120,
-// então SCALE_MG_PER_L = 0.25 / 120 = 0.002083
-float SCALE_MG_PER_L = 0.0020; // chute inicial (ajuste depois)
+uint32_t t0 = 0;
+uint32_t lastSample = 0;
 
-// Limite máximo para não explodir número na tela
-const float MAX_MG_L = 2.00; // 2.00 mg/L é bem alto (ajuste como quiser)
+float adcEma = 0.0f;
 
-int readMQ3Average() {
-  long sum = 0;
-  for (int i = 0; i < SAMPLES; i++) {
-    sum += analogRead(MQ3_PIN);
-    delay(5);
-  }
-  return (int)(sum / SAMPLES);
+uint32_t baselineCount = 0;
+double baselineSum = 0;
+float baselineAdc = 0;
+
+// ===================== HELPERS =====================
+static void drawCenterText(const String &s, int y) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(s, 0, y, &x1, &y1, &w, &h);
+  int x = (SCREEN_WIDTH - (int)w) / 2;
+  display.setCursor(x, y);
+  display.print(s);
 }
 
-void showMessage(const char* line1, const char* line2 = nullptr) {
+static void drawProgressBar(int x, int y, int w, int h, float pct) {
+  if (pct < 0) pct = 0;
+  if (pct > 1) pct = 1;
+  display.drawRect(x, y, w, h, SSD1306_WHITE);
+  int fill = (int)((w - 2) * pct);
+  display.fillRect(x + 1, y + 1, fill, h - 2, SSD1306_WHITE);
+}
+
+static void showWarmup(uint32_t elapsedSec) {
+  uint32_t left = (elapsedSec >= WARMUP_SEC) ? 0 : (WARMUP_SEC - elapsedSec);
+
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
+
   display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println(line1);
-  if (line2) display.println(line2);
+  drawCenterText("BAFOMETRO MQ-3", 0);
+
+  display.setTextSize(1);
+  drawCenterText("Aquecendo / Calibrando", 16);
+
+  display.setTextSize(2);
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%lus", (unsigned long)left);
+  drawCenterText(String(buf), 32);
+
+  float pct = (float)elapsedSec / (float)WARMUP_SEC;
+  drawProgressBar(10, 56, 108, 7, pct);
+
   display.display();
 }
 
-void calibrateBaseline() {
-  // Mede baseline no ar “limpo” por alguns segundos e tira média
-  showMessage("Calibrando baseline", "Nao sopre (ar limpo)");
+static void showRunning(float mgL, int adcNow) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
 
-  const int N = 60;
-  long sum = 0;
-  for (int i = 0; i < N; i++) {
-    sum += readMQ3Average();
-    delay(50);
-  }
-  baselineRaw = (int)(sum / N);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("MQ-3  | Base:");
+  display.print((int)baselineAdc);
+
+  display.setCursor(0, 12);
+  display.print("ADC:");
+  display.print(adcNow);
+
+  display.setTextSize(2);
+  display.setCursor(0, 28);
+  display.print(mgL, 2);
+  display.print(" mg/L");
+
+  // barra 0..MG_L_MAX
+  float pct = mgL / MG_L_MAX;
+  drawProgressBar(10, 56, 108, 7, pct);
+
+  display.display();
 }
 
+// ===================== SETUP =====================
 void setup() {
-  pinMode(MQ3_PIN, INPUT);
-  Wire.begin();
+  // Serial opcional
+  Serial.begin(115200);
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+  // I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // Display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    // se não achar 0x3C, tente 0x3D (alguns módulos são 0x3D)
     while (true) { delay(100); }
   }
 
-  showMessage("MQ-3 + OLED 0.96", "Aquecendo...");
-}
+  // ADC config (ESP32-S3)
+  analogReadResolution(12); // 0..4095
+  // Atenuacao p/ ler ate ~3.3V (aprox)
+  analogSetPinAttenuation(MQ3_PIN, ADC_11db);
 
-void loop() {
-  static unsigned long startMs = millis();
-  unsigned long elapsed = millis() - startMs;
+  // inicia EMA com uma leitura inicial
+  int r0 = analogRead(MQ3_PIN);
+  adcEma = (float)r0;
 
-  // Aguarda aquecimento antes de calibrar baseline
-  if (baselineRaw == 0) {
-    if (elapsed < WARMUP_MS) {
-      // Mostra contagem regressiva simples
-      unsigned long remain = (WARMUP_MS - elapsed) / 1000UL;
+  t0 = millis();
+  st = ST_WARMUP;
 
-      display.clearDisplay();
-      display.setTextColor(SSD1306_WHITE);
-      display.setTextSize(1);
-      display.setCursor(0, 0);
-      display.println("Aquecendo sensor...");
-      display.setCursor(0, 16);
-      display.print("Faltam: ");
-      display.print(remain);
-      display.println(" s");
-      display.setCursor(0, 32);
-      display.println("Depois calibra zero.");
-      display.display();
-
-      delay(300);
-      return;
-    } else {
-      calibrateBaseline();
-      showMessage("Baseline OK!", "Pode medir/soprar");
-      delay(800);
-    }
-  }
-
-  int raw = readMQ3Average();
-  int delta = raw - baselineRaw;
-  if (delta < 0) delta = 0;
-
-  // “mg/L estimado” baseado no delta e no fator
-  float mgL = delta * SCALE_MG_PER_L;
-  if (mgL > MAX_MG_L) mgL = MAX_MG_L;
-
-  // Tensão só pra debug
-  float volts = raw * (5.0 / 1023.0);
-
-  // Tela
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-
   display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("Bafometro (estimado)");
-
-  display.setCursor(0, 14);
-  display.print("mg/L: ");
-  display.setTextSize(2);
-  display.setCursor(0, 24);
-  display.print(mgL, 2);
-  display.setTextSize(1);
-
-  display.setCursor(0, 48);
-  display.print("RAW:");
-  display.print(raw);
-  display.print(" 0:");
-  display.print(baselineRaw);
-
-  // Barrinha mg/L (0..MAX_MG_L)
-  display.drawRect(0, 56, 128, 8, SSD1306_WHITE);
-  int bar = (int)(126.0 * (mgL / MAX_MG_L));
-  if (bar < 0) bar = 0;
-  if (bar > 126) bar = 126;
-  display.fillRect(1, 57, bar, 6, SSD1306_WHITE);
-
+  drawCenterText("Iniciando...", 24);
   display.display();
-  delay(200);
+}
+
+// ===================== LOOP =====================
+void loop() {
+  uint32_t now = millis();
+
+  // amostragem periódica
+  if (now - lastSample >= SAMPLE_MS) {
+    lastSample = now;
+
+    int adcRaw = analogRead(MQ3_PIN);
+
+    // EMA
+    adcEma = (EMA_ALPHA * (float)adcRaw) + ((1.0f - EMA_ALPHA) * adcEma);
+
+    // durante warmup: acumula baseline (últimos ~30s, por exemplo)
+    if (st == ST_WARMUP) {
+      // começa a coletar baseline depois de um tempinho (ex: após 30s),
+      // pra evitar a subida inicial mais agressiva do aquecimento.
+      uint32_t elapsedSec = (now - t0) / 1000;
+
+      if (elapsedSec >= 30 && baselineCount < BASELINE_SAMPLES) {
+        baselineSum += adcEma;
+        baselineCount++;
+        baselineAdc = (float)(baselineSum / (double)baselineCount);
+      }
+
+      showWarmup(elapsedSec);
+
+      if (elapsedSec >= WARMUP_SEC) {
+        // se não coletou baseline suficiente, usa o valor atual
+        if (baselineCount == 0) baselineAdc = adcEma;
+
+        st = ST_RUNNING;
+      }
+    } else {
+      // RUN
+      float delta = adcEma - baselineAdc;
+      if (delta < 0) delta = 0;
+
+      float mgL = delta * MG_PER_L_PER_ADC;
+      if (mgL < 0) mgL = 0;
+      if (mgL > 9.99f) mgL = 9.99f; // evita estourar visualmente
+
+      showRunning(mgL, (int)adcEma);
+
+      // debug opcional
+      // Serial.printf("raw=%d ema=%.1f base=%.1f mg/L=%.2f\n", adcRaw, adcEma, baselineAdc, mgL);
+    }
+  }
 }
