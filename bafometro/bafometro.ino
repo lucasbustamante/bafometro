@@ -4,11 +4,12 @@
 
 // ===================== PINAGEM (seguindo a imagem) =====================
 // OLED I2C
-static const int I2C_SDA = 8;   // PIN 8 (assumindo GPIO8)
-static const int I2C_SCL = 9;   // PIN 9 (assumindo GPIO9)
+static const int I2C_SDA = 2;   // GPIO1
+static const int I2C_SCL = 3;   // GPIO2
 
-// MQ-3 analógico
-static const int MQ3_PIN = 1;   // PIN 1 (assumindo GPIO1 / ADC)
+// MQ-3 analógico (ADC)
+static const int MQ3_PIN = 4;   // GPIO4 (ADC)
+
 
 // ===================== DISPLAY =====================
 #define SCREEN_WIDTH 128
