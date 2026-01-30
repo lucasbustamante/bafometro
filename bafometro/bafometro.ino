@@ -18,7 +18,7 @@ static const int MQ3_PIN = 4;   // GPIO4 (ADC)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ===================== CONFIG =====================
-static const uint32_t WARMUP_SEC = 10;     // 3 minutos
+static const uint32_t WARMUP_SEC = 180;     // 3 minutos
 static const uint16_t SAMPLE_MS  = 50;      // taxa de amostragem do ADC
 static const uint16_t BASELINE_SAMPLES = 600; // ~30s se SAMPLE_MS=50
 
